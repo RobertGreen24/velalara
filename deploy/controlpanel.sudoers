@@ -1,0 +1,3 @@
+# Install root:root mode 0440 as /etc/sudoers.d/controlpanel; validate with visudo -cf.
+# No arguments are permitted. The helper reads one bounded JSON request from stdin.
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/velalara-helper ""
