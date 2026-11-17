@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+"""Root-owned, fixed-purpose privileged API. Never accepts commands or paths outside public_html."""
+import base64
+import fcntl
+import json
+import os
+import pwd
+import re
+import secrets
+import subprocess
+import sys
+import syslog
+import tempfile
+from pathlib import Path
+
+STATE = Path('/var/lib/velalara/accounts')
+PHP = '8.3'
+USER_RE = re.compile(r'vl_[a-z0-9]{12}\Z')
+DOMAIN_RE = re.compile(r'(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\Z')
+
+
+def run(args, data=None, timeout=120):
+    result = subprocess.run(args, input=data, text=True, capture_output=True, timeout=timeout, env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'})
+    if result.returncode:
+        syslog.syslog(syslog.LOG_ERR, 'velalara command failed: ' + args[0])
+        # Do not return command output to the web tier: it may contain credentials.
+        raise RuntimeError('System command failed: ' + args[0])
+    return result.stdout
+
+
+def username(value):
+    if not isinstance(value, str) or not USER_RE.fullmatch(value):
+        raise ValueError('Invalid account name')
+    return value
+
+
+def domain(value):
+    if not isinstance(value, str) or not DOMAIN_RE.fullmatch(value):
+        raise ValueError('Invalid domain')
+    return value
+
+
+def account(name):
+    username(name)
+    if not (STATE / name).is_file() or (STATE / name).is_symlink():
+        raise ValueError('Unknown account')
+    p = pwd.getpwnam(name)
+    if p.pw_dir != '/home/' + name:
+        raise ValueError('Invalid account home')
+    return p
+
+
+def atomic(path, content, mode=0o644):
+    path = Path(path)
+    fd, temp = tempfile.mkstemp(prefix='.velalara-', dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as f:
+            f.write(content)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp): os.unlink(temp)
+
+
+def create_account(name):
+    username(name)
+    if (STATE / name).exists() or Path('/home/' + name).exists(): raise ValueError('Account already exists')
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        pass
+    else:
+        raise ValueError('Account already exists')
+    run(['/usr/sbin/useradd', '--create-home', '--user-group', '--shell', '/usr/sbin/nologin', name])
+    p = pwd.getpwnam(name)
+    home = Path(p.pw_dir)
+    os.chmod(home, 0o700)
+    run(['/usr/bin/setfacl', '-m', 'u:www-data:--x', str(home)])
+    web = home / 'public_html'
+    web.mkdir(mode=0o750)
+    os.chown(web, p.pw_uid, p.pw_gid)
+    run(['/usr/bin/setfacl', '-m', 'u:www-data:r-x,d:u:www-data:r-x', str(web)])
+    atomic(STATE / name, 'managed\n', 0o600)
+    pool = f'''[{name}]
+user = {name}
+group = {name}
+listen = /run/php/{name}.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 5
+pm.process_idle_timeout = 10s
+chdir = /
+'''
+    atomic(f'/etc/php/{PHP}/fpm/pool.d/{name}.conf', pool)
+    run(['/usr/sbin/php-fpm' + PHP, '-t'])
+    run(['/usr/bin/systemctl', 'reload', 'php' + PHP + '-fpm.service'])
+    return {'username': name}
+
+
+def nginx_config(name, host, ssl=False):
+    tls = ''
+    if ssl:
+        tls = f'''    listen 443 ssl;
+    listen [::]:443 ssl;
+    ssl_certificate /etc/letsencrypt/live/{host}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{host}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+'''
+    return f'''server {{
+    listen 80;
+    listen [::]:80;
+{tls}    server_name {host};
+    root /home/{name}/public_html;
+    index index.php index.html;
+    disable_symlinks on;
+    location ^~ /.well-known/acme-challenge/ {{ root /var/lib/velalara/acme; default_type text/plain; }}
+    location / {{ try_files $uri $uri/ /index.php?$query_string; }}
+    location ~ \\.php$ {{
+        try_files $uri =404;
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/{name}.sock;
+    }}
+    location ~ /\\.(?!well-known) {{ deny all; }}
+}}
+'''
+
+
+def install_site(name, host, ssl=False):
+    account(name); domain(host)
+    panel = Path('/etc/nginx/sites-available/velalara-panel')
+    if panel.is_file() and not panel.is_symlink():
+        names = re.findall(r'(?m)^\s*server_name\s+([^;]+);', panel.read_text())
+        if any(host in line.split() for line in names): raise ValueError('Panel domain is reserved')
+    available = Path('/etc/nginx/sites-available') / ('velalara-' + host)
+    enabled = Path('/etc/nginx/sites-enabled') / ('velalara-' + host)
+    if available.is_symlink() or (enabled.exists() and not enabled.is_symlink()):
+        raise ValueError('Unexpected nginx site path')
+    old = available.read_text() if available.exists() else None
+    # Existing site must belong to the same account; never overwrite a foreign site.
+    if old is not None and ('    root /home/' + name + '/public_html;\n') not in old:
+        raise ValueError('Domain already belongs to another account')
+    if enabled.is_symlink() and os.readlink(enabled) != str(available):
+        raise ValueError('Unexpected nginx site link')
+    try:
+        atomic(available, nginx_config(name, host, ssl))
+        if not enabled.is_symlink(): enabled.symlink_to(available)
+        run(['/usr/sbin/nginx', '-t'])
+        run(['/usr/bin/systemctl', 'reload', 'nginx.service'])
+    except Exception:
+        if old is None:
+            available.unlink(missing_ok=True); enabled.unlink(missing_ok=True)
+        else:
+            atomic(available, old)
+        raise
+    return {'domain': host}
+
+
+def create_database(name):
+    account(name)
+    suffix = secrets.token_hex(5)
+    db = 'v' + suffix
+    dbuser = 'u' + suffix
+    password = secrets.token_hex(24)
+    sql = (f"CREATE DATABASE `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+           f"CREATE USER '{dbuser}'@'localhost' IDENTIFIED BY '{password}';\n"
+           f"GRANT ALL PRIVILEGES ON `{db}`.* TO '{dbuser}'@'localhost';\n")
+    run(['/usr/bin/mariadb', '--protocol=socket', '--user=root'], sql)
+    return {'database': db, 'db_user': dbuser, 'password': password}
+
+
+def certificate(name, host, email):
+    account(name); domain(host)
+    if not isinstance(email, str) or len(email) > 254 or not re.fullmatch(r'[A-Za-z0-9.!#$%&\x27*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+', email):
+        raise ValueError('Invalid email')
+    path = Path('/etc/nginx/sites-available') / ('velalara-' + host)
+    if not path.is_file() or path.is_symlink() or ('    root /home/' + name + '/public_html;\n') not in path.read_text():
+        raise ValueError('Domain not provisioned for account')
+    run(['/usr/bin/certbot', 'certonly', '--webroot', '-w', '/var/lib/velalara/acme', '-d', host, '--email', email, '--agree-tos', '--non-interactive', '--keep-until-expiring'], timeout=300)
+    return install_site(name, host, True)
+
+
+def file_op(name, action, path, content=None):
+    p = account(name)
+    if not isinstance(path, str) or len(path) > 1024 or '\x00' in path or path.startswith('/'):
+        raise ValueError('Invalid path')
+    parts = path.split('/') if path else []
+    if any(x in ('', '.', '..') or len(x.encode()) > 255 for x in parts): raise ValueError('Invalid path')
+    # Drop all privileges BEFORE touching account-controlled paths, so this cannot read root-owned files.
+    os.setgroups([]); os.setgid(p.pw_gid); os.setuid(p.pw_uid)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open('/home/' + name + '/public_html', flags)
+    try:
+        dirs = parts if action == 'list' else parts[:-1]
+        for part in dirs:
+            nxt = os.open(part, flags, dir_fd=fd); os.close(fd); fd = nxt
+        if action == 'list':
+            return {'entries': sorted([{'name': n, 'directory': os.path.isdir('/proc/self/fd/%d/%s' % (fd, n)) and not os.path.islink('/proc/self/fd/%d/%s' % (fd, n))} for n in os.listdir(fd)], key=lambda x: x['name'])[:1000]}
+        if not parts: raise ValueError('File path required')
+        leaf = parts[-1]
+        if action == 'read':
+            f = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            try:
+                import stat
+                if not stat.S_ISREG(os.fstat(f).st_mode): raise ValueError('Not a regular file')
+                data = os.read(f, 262145)
+                if len(data) > 262144: raise ValueError('File too large')
+                return {'content': base64.b64encode(data).decode()}
+            finally: os.close(f)
+        if action == 'write':
+            data = base64.b64decode(content, validate=True)
+            if len(data) > 262144: raise ValueError('File too large')
+            # Avoid following links and avoid opening FIFOs/devices. Replace atomically within directory.
+            temp = '.velalara-' + secrets.token_hex(12)
+            out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+            try:
+                with os.fdopen(out, 'wb') as f: f.write(data)
+                os.rename(temp, leaf, src_dir_fd=fd, dst_dir_fd=fd)
+            finally:
+                try: os.unlink(temp, dir_fd=fd)
+                except FileNotFoundError: pass
+            return {'ok': True}
+        if action == 'delete':
+            os.unlink(leaf, dir_fd=fd); return {'ok': True}
+        raise ValueError('Invalid file action')
+    finally: os.close(fd)
+
+
+def main(req):
+    action = req.get('action')
+    name = req.get('username')
+    if action == 'account.create': return create_account(name)
+    if action == 'domain.create': return install_site(name, req.get('domain'))
+    if action == 'database.create': return create_database(name)
+    if action == 'certificate.issue': return certificate(name, req.get('domain'), req.get('email'))
+    if action in ('file.list', 'file.read', 'file.write', 'file.delete'):
+        return file_op(name, action[5:], req.get('path', ''), req.get('content'))
+    raise ValueError('Unknown operation')
+
+if __name__ == '__main__':
+    try:
+        if os.geteuid() != 0: raise ValueError('Must run as root')
+        raw = sys.stdin.buffer.read(400001)
+        if len(raw) > 400000: raise ValueError('Request too large')
+        req = json.loads(raw)
+        if not isinstance(req, dict): raise ValueError('Invalid request')
+        # Provisioning serialized across PHP workers; file operations run independently.
+        if str(req.get('action', '')).startswith('file.'):
+            result = main(req)
+        else:
+            with open('/run/lock/velalara.lock', 'w') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                result = main(req)
+        print(json.dumps(result))
+    except Exception as e:
+        syslog.syslog(syslog.LOG_ERR, 'velalara helper error: ' + type(e).__name__)
+        print(json.dumps({'error': str(e) if isinstance(e, (ValueError, KeyError)) else 'Operation failed; inspect system logs'}))
+        sys.exit(1)
